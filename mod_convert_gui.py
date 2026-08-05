@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
+# SDR-S50 Converter — convert Panasonic/JVC camcorder .MOD/.TOD files
+# Copyright (C) 2026  larszu
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 SDR-S50 Converter — a small Tkinter GUI for turning Panasonic/JVC camcorder
-.MOD / .TOD files into modern, deinterlaced, square-pixel MP4s (or lossless
-archive MKVs).
+.MOD / .TOD files into modern, deinterlaced, square-pixel MP4s, or into a
+lossless archive (.mkv or .mp4).
 
-It is a thin front-end over mod_convert_core: pick files or a folder, choose a
-mode and quality, hit Convert. Conversions run on a background thread so the
-window stays responsive, with a per-file and overall progress bar and a log.
+It is a thin front-end over mod_convert_core: pick files or a folder, press
+"Analyse selected" to see what you actually have, choose a mode and quality,
+hit Convert. Conversions run on a background thread so the window stays
+responsive, with per-file and overall progress bars and a log.
 
 Run:  python3 mod_convert_gui.py
 Requires: Python 3.9+ with tkinter (bundled with the python.org / Homebrew
-builds on macOS) and ffmpeg + ffprobe on PATH.
+builds on macOS). ffmpeg + ffprobe are bundled into the released app; when
+running from source they are taken from PATH (or SDRS50_FFMPEG_DIR).
 """
 
 from __future__ import annotations
@@ -30,12 +47,21 @@ APP_TITLE = "SDR-S50 Converter"
 MODE_LABELS = {
     core.MODE_MP4: "MP4 · 50p (deinterlace, field-doubled) — recommended",
     core.MODE_MP4_25P: "MP4 · 25p (deinterlace, woven) — smaller",
-    core.MODE_ARCHIVE: "Archive · lossless remux to .mkv (streams untouched)",
+    core.MODE_ARCHIVE: "Archive · lossless remux (streams untouched)",
 }
 ASPECT_LABELS = {
     core.ASPECT_AUTO: "Auto (from file)",
     "16:9": "Force 16:9",
     "4:3": "Force 4:3",
+}
+FIELD_LABELS = {
+    core.FIELD_AUTO: "Auto — detect from file (recommended)",
+    core.FIELD_TFF: "Top field first (TFF)",
+    core.FIELD_BFF: "Bottom field first (BFF)",
+}
+CONTAINER_LABELS = {
+    core.CONTAINER_MKV: "MKV — keeps MPEG-2 + MP2 natively (safest)",
+    core.CONTAINER_MP4: "MP4 — also lossless; MP2 audio may not play in QuickTime",
 }
 
 
@@ -50,6 +76,8 @@ class ConverterApp:
         self.mode_var = tk.StringVar(value=core.MODE_MP4)
         self.crf_var = tk.IntVar(value=20)
         self.aspect_var = tk.StringVar(value=core.ASPECT_AUTO)
+        self.field_var = tk.StringVar(value=core.FIELD_AUTO)
+        self.container_var = tk.StringVar(value=core.CONTAINER_MKV)
         self.outdir_var = tk.StringVar(value="")   # empty = alongside source
         self.overwrite_var = tk.BooleanVar(value=False)
         self.recursive_var = tk.BooleanVar(value=True)
@@ -59,6 +87,7 @@ class ConverterApp:
         self._events: "queue.Queue[tuple]" = queue.Queue()
 
         self._build_ui()
+        self._on_mode_change()      # apply the enable/disable rules for the default mode
         self._check_ffmpeg()
         self.root.after(100, self._drain_events)
 
@@ -120,17 +149,33 @@ class ConverterApp:
         self.crf_label = ttk.Label(q_frame, text="20  (lower = better/larger)", width=26)
         self.crf_label.grid(row=0, column=1, padx=(8, 0))
 
-        ttk.Label(opt, text="Aspect:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(opt, text="Field order:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        fld = ttk.Combobox(opt, state="readonly", width=48,
+                           values=list(FIELD_LABELS.values()))
+        fld.set(FIELD_LABELS[core.FIELD_AUTO])
+        fld.grid(row=2, column=1, sticky="ew", padx=6, pady=4)
+        self._field_box = fld
+        fld.bind("<<ComboboxSelected>>", self._on_field_change)
+
+        ttk.Label(opt, text="Archive as:").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        cnt = ttk.Combobox(opt, state="readonly", width=48,
+                           values=list(CONTAINER_LABELS.values()))
+        cnt.set(CONTAINER_LABELS[core.CONTAINER_MKV])
+        cnt.grid(row=3, column=1, sticky="ew", padx=6, pady=4)
+        self._container_box = cnt
+        cnt.bind("<<ComboboxSelected>>", self._on_container_change)
+
+        ttk.Label(opt, text="Aspect:").grid(row=4, column=0, sticky="w", padx=6, pady=4)
         asp = ttk.Combobox(opt, state="readonly",
                            values=list(ASPECT_LABELS.values()))
         asp.set(ASPECT_LABELS[core.ASPECT_AUTO])
-        asp.grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        asp.grid(row=4, column=1, sticky="w", padx=6, pady=4)
         self._aspect_box = asp
         asp.bind("<<ComboboxSelected>>", self._on_aspect_change)
 
-        ttk.Label(opt, text="Output:").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(opt, text="Output:").grid(row=5, column=0, sticky="w", padx=6, pady=4)
         out_frame = ttk.Frame(opt)
-        out_frame.grid(row=3, column=1, sticky="ew", padx=6, pady=4)
+        out_frame.grid(row=5, column=1, sticky="ew", padx=6, pady=4)
         out_frame.columnconfigure(0, weight=1)
         self.out_entry = ttk.Entry(out_frame, textvariable=self.outdir_var)
         self.out_entry.grid(row=0, column=0, sticky="ew")
@@ -139,7 +184,7 @@ class ConverterApp:
         ttk.Button(out_frame, text="Beside source", command=lambda: self.outdir_var.set("")).grid(row=0, column=2, padx=(6, 0))
 
         ttk.Checkbutton(opt, text="Overwrite existing output files",
-                        variable=self.overwrite_var).grid(row=4, column=1, sticky="w", padx=6, pady=(2, 6))
+                        variable=self.overwrite_var).grid(row=6, column=1, sticky="w", padx=6, pady=(2, 6))
 
         # --- Progress + actions ----------------------------------------- #
         prog = ttk.Frame(main)
@@ -160,9 +205,12 @@ class ConverterApp:
         self.cancel_btn = ttk.Button(action, text="Cancel", command=self._request_cancel,
                                      state="disabled")
         self.cancel_btn.pack(side="left", padx=(8, 0))
+        self.analyze_btn = ttk.Button(action, text="Analyse selected",
+                                      command=self._analyze_selected)
+        self.analyze_btn.pack(side="left", padx=(8, 0))
 
         # --- Log --------------------------------------------------------- #
-        log_frame = ttk.LabelFrame(main, text="Log")
+        log_frame = ttk.LabelFrame(main, text="Analysis / Log")
         log_frame.grid(row=4, column=0, sticky="nsew", **pad)
         main.rowconfigure(4, weight=1)
         log_frame.columnconfigure(0, weight=1)
@@ -180,9 +228,13 @@ class ConverterApp:
             if text == label:
                 self.mode_var.set(value)
                 break
+        # In archive mode nothing is re-encoded, so quality/field order/aspect
+        # are meaningless — only the container choice applies.
         archive = self.mode_var.get() == core.MODE_ARCHIVE
-        state = "disabled" if archive else "normal"
-        self.crf_scale.configure(state=state)
+        self.crf_scale.configure(state="disabled" if archive else "normal")
+        self._field_box.configure(state="disabled" if archive else "readonly")
+        self._aspect_box.configure(state="disabled" if archive else "readonly")
+        self._container_box.configure(state="readonly" if archive else "disabled")
 
     def _on_crf_change(self, _val: str) -> None:
         crf = int(round(float(self.crf_scale.get())))
@@ -197,6 +249,41 @@ class ConverterApp:
             if text == label:
                 self.aspect_var.set(value)
                 break
+
+    def _on_field_change(self, *_evt) -> None:
+        label = self._field_box.get()
+        for value, text in FIELD_LABELS.items():
+            if text == label:
+                self.field_var.set(value)
+                break
+
+    def _on_container_change(self, *_evt) -> None:
+        label = self._container_box.get()
+        for value, text in CONTAINER_LABELS.items():
+            if text == label:
+                self.container_var.set(value)
+                break
+
+    def _analyze_selected(self) -> None:
+        """Probe the selected files (or all of them) and print the details."""
+        indices = self.listbox.curselection() or range(len(self.sources))
+        targets = [self.sources[i] for i in indices]
+        if not targets:
+            messagebox.showinfo(APP_TITLE, "Add some .MOD / .TOD files first.")
+            return
+        if core.which_ffmpeg("ffprobe") is None:
+            messagebox.showerror(APP_TITLE, "ffprobe not found.")
+            return
+
+        self.analyze_btn.configure(state="disabled")
+
+        def work() -> None:
+            for path in targets[:20]:      # keep the log readable
+                self._post("log", core.describe(path))
+                self._post("log", "")
+            self._post("analysis_done", None)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _choose_outdir(self) -> None:
         d = filedialog.askdirectory(title="Choose output folder")
@@ -258,6 +345,8 @@ class ConverterApp:
             aspect=self.aspect_var.get(),
             output_dir=self.outdir_var.get().strip() or None,
             overwrite=self.overwrite_var.get(),
+            archive_container=self.container_var.get(),
+            field_order=self.field_var.get(),
         )
 
     def _start(self) -> None:
@@ -334,6 +423,8 @@ class ConverterApp:
                     self.file_progress.configure(value=payload)
                 elif kind == "overall_progress":
                     self.overall_progress.configure(value=payload)
+                elif kind == "analysis_done":
+                    self.analyze_btn.configure(state="normal")
                 elif kind == "done":
                     self._on_done(*payload)
         except queue.Empty:

@@ -33,8 +33,9 @@ would rather keep the two entirely separate, build without bundling and let the
 app use an ffmpeg the user installs themselves — the app already falls back to
 whatever it finds on `PATH`.
 
-> If you intend to publish releases publicly, add a `LICENSE` file to this
-> repository so the terms covering your own code are unambiguous.
+This project itself is licensed **GPL-3.0-or-later** (see `LICENSE`), which is
+compatible with the bundled FFmpeg and keeps the released `.dmg` / `.exe`
+unambiguously copyleft end to end.
 
 ## Patents / codecs
 

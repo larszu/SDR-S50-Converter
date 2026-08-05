@@ -1,4 +1,19 @@
 #!/usr/bin/env python3
+# SDR-S50 Converter — convert Panasonic/JVC camcorder .MOD/.TOD files
+# Copyright (C) 2026  larszu
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 mod_convert_core — Conversion engine for Panasonic/JVC camcorder .MOD/.TOD files.
 
@@ -38,8 +53,19 @@ SOURCE_EXTENSIONS = (".mod", ".tod")
 
 MODE_MP4 = "mp4"          # H.264/AAC, bwdif field-doubling -> 50p, square pixels
 MODE_MP4_25P = "mp4-25p"  # H.264/AAC, bwdif weave         -> 25p, square pixels
-MODE_ARCHIVE = "archive"  # lossless remux, streams untouched -> .mkv
+MODE_ARCHIVE = "archive"  # lossless remux, streams untouched
 MODES = (MODE_MP4, MODE_MP4_25P, MODE_ARCHIVE)
+
+# Container choices for archive mode.
+CONTAINER_MKV = "mkv"
+CONTAINER_MP4 = "mp4"
+ARCHIVE_CONTAINERS = (CONTAINER_MKV, CONTAINER_MP4)
+
+# Field-order handling for deinterlacing.
+FIELD_AUTO = "auto"
+FIELD_TFF = "tff"
+FIELD_BFF = "bff"
+FIELD_ORDERS = (FIELD_AUTO, FIELD_TFF, FIELD_BFF)
 
 # Aspect override tokens accepted from the UI / CLI.  "auto" means: derive the
 # display aspect from the container sample-aspect-ratio (works for NTSC too).
@@ -61,6 +87,20 @@ class VideoInfo:
     field_order: str = "progressive"   # tff | bff | progressive
     duration: float = 0.0              # seconds, may be 0 if unknown
 
+    # Descriptive extras — used for the info panel and for carrying the
+    # source's colour characteristics into the encode.
+    codec: str = ""
+    frame_rate: str = ""               # e.g. "25/1"
+    color_space: str = ""
+    color_primaries: str = ""
+    color_trc: str = ""
+    color_range: str = ""
+    container: str = ""
+    audio_codec: str = ""
+    audio_rate: str = ""
+    audio_channels: str = ""
+    audio_bitrate_src: str = ""
+
     @property
     def is_interlaced(self) -> bool:
         return self.field_order in ("tff", "bff")
@@ -69,6 +109,21 @@ class VideoInfo:
     def parity(self) -> str:
         """bwdif parity argument matching the detected field order."""
         return "bff" if self.field_order == "bff" else "tff"
+
+    @property
+    def fps(self) -> float:
+        try:
+            return float(Fraction(self.frame_rate))
+        except (ValueError, ZeroDivisionError):
+            return 0.0
+
+    @property
+    def dar(self) -> str:
+        """Display aspect ratio as a reduced 'a:b' string."""
+        if not self.width or not self.height:
+            return "?"
+        ratio = Fraction(self.width, self.height) * self.sar
+        return f"{ratio.numerator}:{ratio.denominator}"
 
 
 # Environment escape hatch: point at a folder holding ffmpeg/ffprobe to override
@@ -153,9 +208,11 @@ def probe_video(path: str, ffprobe: str = "ffprobe") -> VideoInfo:
 
     cmd = [
         resolved, "-v", "error",
-        "-select_streams", "v:0",
         "-show_entries",
-        "stream=width,height,sample_aspect_ratio,field_order:format=duration",
+        "stream=codec_type,codec_name,width,height,sample_aspect_ratio,"
+        "field_order,r_frame_rate,color_space,color_primaries,color_transfer,"
+        "color_range,sample_rate,channels,bit_rate"
+        ":format=duration,format_name",
         "-of", "default=noprint_wrappers=1",
         path,
     ]
@@ -165,24 +222,87 @@ def probe_video(path: str, ffprobe: str = "ffprobe") -> VideoInfo:
     return _parse_probe(out.stdout)
 
 
+# ffprobe spells top/bottom-field-first several ways depending on where the
+# flag came from; normalise them all.
+_FIELD_ORDER_MAP = {
+    "tt": "tff", "tff": "tff", "tb": "tff",
+    "bb": "bff", "bff": "bff", "bt": "bff",
+    "progressive": "progressive",
+}
+
+
 def _parse_probe(text: str) -> VideoInfo:
-    values: dict[str, str] = {}
+    """Parse ffprobe's flat key=value output into a VideoInfo.
+
+    The output contains one block per stream plus the format block, so keys
+    repeat. We keep the first video stream and the first audio stream.
+    """
+    blocks: list[dict[str, str]] = []
+    current: dict[str, str] = {}
     for line in text.splitlines():
-        if "=" in line:
-            key, _, val = line.partition("=")
-            values[key.strip()] = val.strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        # A repeated key means a new stream block started.
+        if key in current:
+            blocks.append(current)
+            current = {}
+        current[key] = val
+    if current:
+        blocks.append(current)
+
+    def first(pred) -> dict[str, str]:
+        for b in blocks:
+            if pred(b):
+                return b
+        return {}
+
+    video = first(lambda b: b.get("codec_type") == "video")
+    if not video:
+        # Output from a "-select_streams v" style probe omits codec_type;
+        # fall back to whichever block carries picture dimensions.
+        video = first(lambda b: "width" in b or "field_order" in b)
+    audio = first(lambda b: b.get("codec_type") == "audio")
+    fmt = first(lambda b: "format_name" in b or "duration" in b and "codec_type" not in b)
 
     info = VideoInfo()
-    info.width = int(values.get("width") or 0)
-    info.height = int(values.get("height") or 0)
-    info.sar = _parse_ratio(values.get("sample_aspect_ratio"))
-    fo = (values.get("field_order") or "progressive").lower()
-    info.field_order = fo if fo in ("tff", "bff", "progressive") else "progressive"
+    info.width = _int(video.get("width"))
+    info.height = _int(video.get("height"))
+    info.sar = _parse_ratio(video.get("sample_aspect_ratio"))
+    fo = (video.get("field_order") or "progressive").lower()
+    info.field_order = _FIELD_ORDER_MAP.get(fo, "progressive")
+    info.codec = _clean(video.get("codec_name"))
+    info.frame_rate = _clean(video.get("r_frame_rate"))
+    info.color_space = _clean(video.get("color_space"))
+    info.color_primaries = _clean(video.get("color_primaries"))
+    info.color_trc = _clean(video.get("color_transfer"))
+    info.color_range = _clean(video.get("color_range"))
+
+    info.audio_codec = _clean(audio.get("codec_name"))
+    info.audio_rate = _clean(audio.get("sample_rate"))
+    info.audio_channels = _clean(audio.get("channels"))
+    info.audio_bitrate_src = _clean(audio.get("bit_rate"))
+
+    info.container = _clean(fmt.get("format_name"))
     try:
-        info.duration = float(values.get("duration") or 0.0)
+        info.duration = float(fmt.get("duration") or video.get("duration") or 0.0)
     except ValueError:
         info.duration = 0.0
     return info
+
+
+def _int(text: Optional[str]) -> int:
+    try:
+        return int(text or 0)
+    except ValueError:
+        return 0
+
+
+def _clean(text: Optional[str]) -> str:
+    """Normalise ffprobe's 'N/A'/'unknown' placeholders to an empty string."""
+    value = (text or "").strip()
+    return "" if value.lower() in ("", "n/a", "unknown", "unspecified") else value
 
 
 def _parse_ratio(text: Optional[str]) -> Fraction:
@@ -222,34 +342,42 @@ def read_moi_datetime(moi_path: str) -> Optional[_dt.datetime]:
     """Extract the recording timestamp from a JVC/Panasonic .MOI header.
 
     The header stores the wall-clock recording time as:
-        offset 0x06  year   (uint16, big-endian)
-        offset 0x08  month  (uint8)
-        offset 0x09  day    (uint8)
-        offset 0x0A  hour   (uint8)
-        offset 0x0B  minute (uint8)
-        offset 0x0C  second (uint8)
+        offset 0x06  year         (uint16, big-endian)
+        offset 0x08  month        (uint8)
+        offset 0x09  day          (uint8)
+        offset 0x0A  hour         (uint8)
+        offset 0x0B  minute       (uint8)
+        offset 0x0C  milliseconds (uint16, big-endian)
+
+    Note the last field: seconds are *not* a plain byte. They are carried as
+    milliseconds-within-the-minute, so 0xBF68 = 49000 ms = second 49. Reading
+    that byte as seconds yields values above 59 and silently loses the date.
 
     Returns a naive datetime (camera local time) or None if the bytes do not
-    form a plausible date — different firmware revisions vary, so we validate
-    rather than trust blindly.
+    form a plausible date — firmware revisions vary, so we validate rather
+    than trust blindly.
     """
     try:
         with open(moi_path, "rb") as fh:
             head = fh.read(16)
     except OSError:
         return None
-    if len(head) < 13:
+    if len(head) < 14:
         return None
 
     year = (head[6] << 8) | head[7]
-    month, day, hour, minute, second = head[8], head[9], head[10], head[11], head[12]
+    month, day, hour, minute = head[8], head[9], head[10], head[11]
+    millis = (head[12] << 8) | head[13]
+    if millis >= 60_000:
+        return None
+    second, micro = divmod(millis, 1000)
     try:
-        stamp = _dt.datetime(year, month, day, hour, minute, second)
+        stamp = _dt.datetime(year, month, day, hour, minute, second, micro * 1000)
     except ValueError:
         return None
     if not (2000 <= year <= 2099):
         return None
-    return stamp
+    return stamp.replace(microsecond=0)
 
 
 def read_moi_aspect_flag(moi_path: str) -> Optional[int]:
@@ -309,14 +437,47 @@ class ConvertOptions:
     audio_bitrate: str = "192k"
     output_dir: Optional[str] = None   # None -> alongside the source file
     overwrite: bool = False
+    # Container for archive mode. MKV keeps MPEG-2 + MP2 in their native
+    # form; MP4 also remuxes losslessly but stores MP2 audio in a way some
+    # players (notably QuickTime) will not decode.
+    archive_container: str = CONTAINER_MKV
+    # Field order for deinterlacing: "auto" trusts the stream flag, "tff"/"bff"
+    # force it. Getting this wrong is the classic source of comb/judder
+    # artefacts, so it is user-overridable.
+    field_order: str = FIELD_AUTO
+    # Carry the source's colour characteristics (PAL material is BT.470BG)
+    # into the output instead of letting players assume BT.709.
+    preserve_color: bool = True
 
 
 def output_path_for(src: str, opts: ConvertOptions) -> str:
     """Return the destination path for a given source and options."""
-    ext = ".mkv" if opts.mode == MODE_ARCHIVE else ".mp4"
+    if opts.mode == MODE_ARCHIVE:
+        ext = ".mp4" if opts.archive_container == CONTAINER_MP4 else ".mkv"
+    else:
+        ext = ".mp4"
     base = os.path.splitext(os.path.basename(src))[0]
     out_dir = opts.output_dir or os.path.dirname(os.path.abspath(src))
     return os.path.join(out_dir, base + ext)
+
+
+def effective_parity(info: VideoInfo, opts: ConvertOptions) -> str:
+    """Resolve the bwdif parity actually used: explicit override, else probe."""
+    if opts.field_order in (FIELD_TFF, FIELD_BFF):
+        return opts.field_order
+    return info.parity
+
+
+def should_deinterlace(info: VideoInfo, opts: ConvertOptions) -> bool:
+    """Whether to run bwdif.
+
+    Interlaced sources are deinterlaced. A forced field order also implies
+    deinterlacing, so users can rescue files whose flag claims progressive
+    but whose content is interlaced.
+    """
+    if opts.mode == MODE_ARCHIVE:
+        return False
+    return info.is_interlaced or opts.field_order in (FIELD_TFF, FIELD_BFF)
 
 
 def build_video_filter(info: VideoInfo, opts: ConvertOptions) -> Optional[str]:
@@ -325,9 +486,9 @@ def build_video_filter(info: VideoInfo, opts: ConvertOptions) -> Optional[str]:
         return None
 
     parts: list[str] = []
-    if info.is_interlaced:
+    if should_deinterlace(info, opts):
         bwdif_mode = "send_field" if opts.mode == MODE_MP4 else "send_frame"
-        parts.append(f"bwdif=mode={bwdif_mode}:parity={info.parity}")
+        parts.append(f"bwdif=mode={bwdif_mode}:parity={effective_parity(info, opts)}")
     width, height = square_pixel_size(info, opts.aspect)
     parts.append(f"scale={width}:{height}:flags=lanczos")
     parts.append("setsar=1")
@@ -358,6 +519,17 @@ def build_command(
         cmd += ["-vf", vf]
         cmd += ["-c:v", "libx264", "-crf", str(opts.crf), "-preset", "medium",
                 "-pix_fmt", "yuv420p"]
+        if opts.preserve_color:
+            # PAL camcorder material is BT.470BG. Without these tags players
+            # fall back to BT.709 and the colours shift.
+            if info.color_space:
+                cmd += ["-colorspace", info.color_space]
+            if info.color_primaries:
+                cmd += ["-color_primaries", info.color_primaries]
+            if info.color_trc:
+                cmd += ["-color_trc", info.color_trc]
+            if info.color_range:
+                cmd += ["-color_range", info.color_range]
         cmd += ["-c:a", "aac", "-b:a", opts.audio_bitrate]
         cmd += ["-movflags", "+faststart"]
 
@@ -372,6 +544,80 @@ def build_command(
 
     cmd += [dst]
     return cmd
+
+
+# --------------------------------------------------------------------------- #
+# Human-readable analysis
+# --------------------------------------------------------------------------- #
+
+_FIELD_ORDER_TEXT = {
+    "tff": "interlaced, top field first (TFF)",
+    "bff": "interlaced, bottom field first (BFF)",
+    "progressive": "progressive",
+}
+
+
+def describe(path: str, ffprobe: str = "ffprobe") -> str:
+    """Return a multi-line human-readable analysis of a source file.
+
+    Used by the GUI's info panel and the CLI's --info flag so the user can see
+    what they actually have — container, real codec, aspect, and above all the
+    field order that drives deinterlacing.
+    """
+    lines: list[str] = [os.path.basename(path)]
+    try:
+        size_mb = os.path.getsize(path) / (1024 * 1024)
+        lines.append(f"  File          {size_mb:.1f} MB")
+    except OSError:
+        pass
+
+    try:
+        info = probe_video(path, ffprobe)
+    except (FileNotFoundError, RuntimeError) as exc:
+        lines.append(f"  Analysis failed: {exc}")
+        return "\n".join(lines)
+
+    container = info.container or "?"
+    lines.append(f"  Container     {container}"
+                 + ("   (a .MOD is really an MPEG-2 Program Stream)"
+                    if "mpeg" in container.lower() else ""))
+    lines.append(f"  Video         {info.codec or '?'} "
+                 f"{info.width}x{info.height}")
+    lines.append(f"  Aspect        SAR {info.sar.numerator}:{info.sar.denominator}"
+                 f"  ->  DAR {info.dar}"
+                 f"  ->  square-pixel output "
+                 f"{square_pixel_size(info)[0]}x{square_pixel_size(info)[1]}")
+    fps = info.fps
+    lines.append(f"  Frame rate    {fps:g} fps"
+                 + (f"  ->  {fps * 2:g} fps after field-doubling"
+                    if info.is_interlaced else ""))
+    lines.append(f"  Scan          {_FIELD_ORDER_TEXT.get(info.field_order, '?')}")
+    if info.duration:
+        lines.append(f"  Duration      {info.duration:.2f} s")
+    colour = info.color_space or "untagged"
+    lines.append(f"  Colour        {colour}"
+                 + ("   (PAL)" if colour == "bt470bg" else ""))
+    if info.audio_codec:
+        bitrate = ""
+        if info.audio_bitrate_src.isdigit():
+            bitrate = f", {int(info.audio_bitrate_src) // 1000} kbit/s"
+        lines.append(f"  Audio         {info.audio_codec}, "
+                     f"{info.audio_rate or '?'} Hz, "
+                     f"{info.audio_channels or '?'} ch{bitrate}")
+
+    moi = moi_sidecar_path(path)
+    if moi:
+        stamp = read_moi_datetime(moi)
+        lines.append(f"  Recorded      {stamp}   (from {os.path.basename(moi)})"
+                     if stamp else
+                     f"  Recorded      unreadable ({os.path.basename(moi)})")
+    else:
+        lines.append("  Recorded      no matching .MOI sidecar")
+
+    if info.is_interlaced:
+        lines.append(f"  -> Deinterlace with parity={info.parity}. "
+                     f"If motion looks jerky or combed, force the other order.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
