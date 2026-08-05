@@ -11,3 +11,6 @@ dmg-staging/
 *.TOD
 *.MOI
 .DS_Store
+vendor/
+ffmpeg-extract/
+*.zip

@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Callable, Iterable, Optional
@@ -70,8 +71,73 @@ class VideoInfo:
         return "bff" if self.field_order == "bff" else "tff"
 
 
+# Environment escape hatch: point at a folder holding ffmpeg/ffprobe to override
+# both the bundled copies and whatever is on PATH.
+FFMPEG_DIR_ENV = "SDRS50_FFMPEG_DIR"
+
+
+def _bundle_dirs() -> list[str]:
+    """Folders that may hold ffmpeg/ffprobe shipped alongside this app.
+
+    Covers the layouts PyInstaller produces: the onefile extraction directory
+    (sys._MEIPASS), the directory of the frozen executable, and the sibling
+    folders inside a macOS .app bundle (Contents/{Frameworks,Resources,MacOS}),
+    since PyInstaller's placement of added binaries differs between versions
+    and between onefile/onedir builds.
+    """
+    dirs: list[str] = []
+
+    override = os.environ.get(FFMPEG_DIR_ENV)
+    if override:
+        dirs.append(override)
+
+    def add_with_siblings(base: str) -> None:
+        dirs.append(base)
+        parent = os.path.dirname(base)
+        for sibling in ("Frameworks", "Resources", "MacOS"):
+            dirs.append(os.path.join(parent, sibling))
+
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        add_with_siblings(meipass)
+    if getattr(sys, "frozen", False):
+        add_with_siblings(os.path.dirname(os.path.abspath(sys.executable)))
+
+    # Running from source: allow a vendor/ folder next to the modules.
+    here = os.path.dirname(os.path.abspath(__file__))
+    dirs.append(os.path.join(here, "vendor"))
+    dirs.append(here)
+    return dirs
+
+
 def which_ffmpeg(name: str = "ffmpeg") -> Optional[str]:
-    """Return the resolved path to ffmpeg/ffprobe or None if not installed."""
+    """Resolve ffmpeg/ffprobe, preferring a bundled copy over PATH.
+
+    Returns an absolute path, or None if the tool cannot be found anywhere.
+    """
+    # An explicit path was handed in — use it as given.
+    if os.path.isabs(name) or os.sep in name:
+        return name if os.path.isfile(name) else shutil.which(name)
+
+    exe = name
+    if sys.platform == "win32" and not exe.lower().endswith(".exe"):
+        exe += ".exe"
+
+    for directory in _bundle_dirs():
+        candidate = os.path.normpath(os.path.join(directory, exe))
+        if not os.path.isfile(candidate):
+            continue
+        if not os.access(candidate, os.X_OK):
+            # Bundled binaries occasionally lose the exec bit in transit;
+            # restore it rather than silently falling through to PATH.
+            try:
+                os.chmod(candidate, os.stat(candidate).st_mode | 0o111)
+            except OSError:
+                continue
+            if not os.access(candidate, os.X_OK):
+                continue
+        return candidate
+
     return shutil.which(name)
 
 
@@ -81,11 +147,12 @@ def probe_video(path: str, ffprobe: str = "ffprobe") -> VideoInfo:
     Raises FileNotFoundError if ffprobe is not installed and RuntimeError if the
     file has no readable video stream.
     """
-    if which_ffmpeg(ffprobe) is None:
-        raise FileNotFoundError(f"{ffprobe} not found on PATH")
+    resolved = which_ffmpeg(ffprobe)
+    if resolved is None:
+        raise FileNotFoundError(f"{ffprobe} not found (bundled or on PATH)")
 
     cmd = [
-        ffprobe, "-v", "error",
+        resolved, "-v", "error",
         "-select_streams", "v:0",
         "-show_entries",
         "stream=width,height,sample_aspect_ratio,field_order:format=duration",
@@ -390,7 +457,11 @@ def convert_file(
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
-    cmd = build_command(src, info, opts, creation_time, ffmpeg, progress_arg=True)
+    resolved_ffmpeg = which_ffmpeg(ffmpeg)
+    if resolved_ffmpeg is None:
+        return ConvertResult(src, dst, False, f"{ffmpeg} not found (bundled or on PATH)")
+
+    cmd = build_command(src, info, opts, creation_time, resolved_ffmpeg, progress_arg=True)
     log("  " + " ".join(_shell_quote(a) for a in cmd))
 
     duration = info.duration or 0.0

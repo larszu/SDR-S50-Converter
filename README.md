@@ -43,8 +43,17 @@ Each GitHub **Release** ships prebuilt binaries, produced by the
   **right-click → Open** to get past Gatekeeper.
 - **Windows** — `SDR-S50-Converter.exe` (single file, no install).
 
-Both bundle Python and Tk but **not ffmpeg** — install ffmpeg separately (see
-below); the app tells you if it can't find it.
+**These are fully self-contained** — Python, Tk *and* ffmpeg/ffprobe are bundled
+in. Nothing to install, no PATH setup. The bundled ffmpeg is a GPL build
+(needed for libx264); see [THIRD-PARTY.md](THIRD-PARTY.md) for what that means
+if you publish releases.
+
+The bundling makes the downloads large (roughly 90 MB on macOS, ~120 MB on
+Windows) — ffmpeg and ffprobe are ~45 MB each. The Windows single-file build
+also unpacks itself on every launch, so the first window takes a few seconds to
+appear. If you'd rather keep the app small, build without the two
+`--add-binary` lines in the workflow: the app then falls back to whatever
+ffmpeg it finds on `PATH`.
 
 To cut a release, publish a GitHub Release (tag) and the workflow builds and
 attaches both files automatically. You can also trigger it manually from the
@@ -52,7 +61,13 @@ Actions tab (**workflow_dispatch**) to smoke-test packaging without a release.
 
 ## Requirements
 
+*(Only when running from source — the prebuilt downloads above need none of
+this.)*
+
 - **ffmpeg** and **ffprobe** on your `PATH` — `brew install ffmpeg` on macOS.
+  Alternatively drop the two binaries into a `vendor/` folder next to the
+  scripts, or point `SDRS50_FFMPEG_DIR` at a folder containing them; both take
+  precedence over `PATH`.
 - For the GUI: **Python 3.9+ with Tkinter**. The python.org and Homebrew Python
   builds include it. (`python3 -c "import tkinter"` should not error.)
 

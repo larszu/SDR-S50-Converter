@@ -129,6 +129,68 @@ class MoiSidecar(unittest.TestCase):
             os.remove(path)
 
 
+class ToolResolution(unittest.TestCase):
+    """The bundled-ffmpeg lookup used by the packaged .dmg / .exe."""
+
+    def setUp(self):
+        self._saved = os.environ.get(core.FFMPEG_DIR_ENV)
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop(core.FFMPEG_DIR_ENV, None)
+        else:
+            os.environ[core.FFMPEG_DIR_ENV] = self._saved
+
+    def test_env_override_wins_over_path(self):
+        with tempfile.TemporaryDirectory() as d:
+            name = "ffmpeg.exe" if core.sys.platform == "win32" else "ffmpeg"
+            fake = os.path.join(d, name)
+            with open(fake, "w") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(fake, 0o755)
+            os.environ[core.FFMPEG_DIR_ENV] = d
+            self.assertEqual(core.which_ffmpeg("ffmpeg"), fake)
+
+    def test_missing_tool_returns_none(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.environ[core.FFMPEG_DIR_ENV] = d
+            self.assertIsNone(core.which_ffmpeg("definitely-not-a-real-tool-xyz"))
+
+    def test_exec_bit_is_restored(self):
+        with tempfile.TemporaryDirectory() as d:
+            name = "ffprobe.exe" if core.sys.platform == "win32" else "ffprobe"
+            fake = os.path.join(d, name)
+            with open(fake, "w") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(fake, 0o644)          # lost the exec bit
+            os.environ[core.FFMPEG_DIR_ENV] = d
+            self.assertEqual(core.which_ffmpeg("ffprobe"), fake)
+            self.assertTrue(os.access(fake, os.X_OK))
+
+    def test_absolute_path_passthrough(self):
+        with tempfile.NamedTemporaryFile(delete=False) as fh:
+            path = fh.name
+        try:
+            self.assertEqual(core.which_ffmpeg(path), path)
+        finally:
+            os.remove(path)
+
+    def test_bundle_dirs_include_app_siblings(self):
+        # Simulate a frozen macOS .app: Contents/Frameworks is _MEIPASS.
+        original = getattr(core.sys, "_MEIPASS", None)
+        core.sys._MEIPASS = "/Apps/X.app/Contents/Frameworks"
+        try:
+            dirs = [os.path.normpath(p) for p in core._bundle_dirs()]
+            self.assertIn("/Apps/X.app/Contents/Frameworks", dirs)
+            self.assertIn("/Apps/X.app/Contents/Resources", dirs)
+            self.assertIn("/Apps/X.app/Contents/MacOS", dirs)
+        finally:
+            if original is None:
+                del core.sys._MEIPASS
+            else:
+                core.sys._MEIPASS = original
+
+
 class Discovery(unittest.TestCase):
     def test_discover_recursive_mixed_case(self):
         with tempfile.TemporaryDirectory() as d:
