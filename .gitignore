@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.mp4
+*.mkv
+*.mov
+*.MOD
+*.TOD
+*.MOI
+.DS_Store
