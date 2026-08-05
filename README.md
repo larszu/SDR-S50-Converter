@@ -33,6 +33,23 @@ date is read from the `.MOI` and written as `creation_time`, and the file's
 modification time is preserved. Folders are walked recursively for `.MOD` and
 `.TOD`.
 
+## Downloads
+
+Each GitHub **Release** ships prebuilt binaries, produced by the
+[`Build release binaries`](.github/workflows/release.yml) workflow:
+
+- **macOS** — `SDR-S50-Converter.dmg` (Apple Silicon). Open it and drag the app
+  to Applications. It's unsigned, so the first launch needs
+  **right-click → Open** to get past Gatekeeper.
+- **Windows** — `SDR-S50-Converter.exe` (single file, no install).
+
+Both bundle Python and Tk but **not ffmpeg** — install ffmpeg separately (see
+below); the app tells you if it can't find it.
+
+To cut a release, publish a GitHub Release (tag) and the workflow builds and
+attaches both files automatically. You can also trigger it manually from the
+Actions tab (**workflow_dispatch**) to smoke-test packaging without a release.
+
 ## Requirements
 
 - **ffmpeg** and **ffprobe** on your `PATH` — `brew install ffmpeg` on macOS.
