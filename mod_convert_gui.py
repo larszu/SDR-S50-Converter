@@ -144,10 +144,12 @@ class ConverterApp:
         q_frame.columnconfigure(0, weight=1)
         self.crf_scale = ttk.Scale(q_frame, from_=16, to=28, orient="horizontal",
                                    command=self._on_crf_change)
-        self.crf_scale.set(20)
         self.crf_scale.grid(row=0, column=0, sticky="ew")
         self.crf_label = ttk.Label(q_frame, text="20  (lower = better/larger)", width=26)
         self.crf_label.grid(row=0, column=1, padx=(8, 0))
+        # Erst set(), wenn crf_label existiert — set() feuert sofort _on_crf_change,
+        # das auf self.crf_label zugreift (sonst AttributeError beim Start).
+        self.crf_scale.set(20)
 
         ttk.Label(opt, text="Field order:").grid(row=2, column=0, sticky="w", padx=6, pady=4)
         fld = ttk.Combobox(opt, state="readonly", width=48,

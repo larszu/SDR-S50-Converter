@@ -4,6 +4,8 @@ A small, dependency-free tool for turning Panasonic/JVC camcorder **`.MOD` /
 `.TOD`** files (as produced by the Panasonic **SDR-S50** and many JVC Everio /
 Canon SD camcorders) into clean, modern **MP4** — or into a lossless archive.
 
+![SDR-S50 Converter – Tkinter-Oberfläche mit Quellliste, Qualität/CRF und Feld­reihenfolge](docs/screenshot.png)
+
 Under the hood a `.MOD` file is just an **MPEG-2 Program Stream** with an
 unusual extension. It plays nowhere by default, and it's **interlaced**, so on a
 progressive display it shows comb artefacts. This tool deinterlaces, rescales to
